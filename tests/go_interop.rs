@@ -40,7 +40,7 @@ fn go_peer() -> &'static Path {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/go-interop");
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("go-interop");
         std::fs::create_dir_all(&dir).unwrap();
-        for file in ["go.mod", "main.go"] {
+        for file in ["go.mod", "go.sum", "main.go"] {
             std::fs::copy(source.join(file), dir.join(file)).unwrap();
         }
         let mut build = std::process::Command::new("go");
@@ -51,7 +51,6 @@ fn go_peer() -> &'static Path {
             std::fs::write(dir.join("go.work"), work).unwrap();
         } else {
             let _ = std::fs::remove_file(dir.join("go.work"));
-            build.env("GOFLAGS", "-mod=mod");
         }
         let binary = dir.join("go-interop");
         let status = build
