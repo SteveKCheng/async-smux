@@ -1,8 +1,10 @@
 # Aborting streams: RESET and STOP_SENDING
 
-**Status: draft proposal, not implemented.** This builds on protocol
+**Status: implemented** as `ProtocolVersion::V2WithReset`, with tests in
+`src/reset_tests.rs` and `src/split_tests.rs`. This builds on protocol
 version 2 (`docs/flow-control.md`). It needs both ends to be configured
-for it, and the Go implementation doesn't support it.
+for it, and the Go implementation doesn't support it: a Go peer rejects
+the first frame (checked by `tests/go_interop.rs`).
 
 ## 1. The problem
 
@@ -194,10 +196,14 @@ able to wrap around, and on a local carrier, where smux belongs (remote
 multiplexing is better served by QUIC), no frame stays in flight for
 anything like the time a wrap-around takes.
 
-A stream's handle should still be kept until it has ended in both
+Ideally, a stream's handle would be kept until it has ended in both
 directions as defined above, so that frames racing the end of the stream
-are recognised, not answered as if the stream were unknown. Today, a PSH
-for an unknown stream gets a FIN in reply.
+are recognised rather than taken for frames of an unknown stream. The
+implementation doesn't do that: it forgets a stream once the application
+has dropped it, as before. Instead, under version 255, a PSH for an
+unknown stream is answered with STOP(0) rather than FIN. That is what the
+writer needs to hear, and it is harmless if the stream had already been
+stopped. Late UPD, RST and STOP frames for unknown streams are ignored.
 
 ### 3.4 Odds and ends
 
@@ -216,6 +222,7 @@ Under version 255 only; versions 1 and 2 behave as now.
 |-----------------------------------------------------------|-------------|--------------------------------|
 | `MuxStream` dropped, write half open                      | FIN         | FIN; RST(0) with reset-on-drop |
 | `MuxStream` dropped, peer's direction not yet ended       | FIN in reply to later data | STOP(0)         |
+| PSH for a stream that no longer exists                    | FIN         | STOP(0)                        |
 | read half dropped (§5.2), peer's direction not yet ended  | —           | STOP(0)                        |
 | write half dropped (§5.2), write half open                | —           | FIN; RST(0) with reset-on-drop |
 | acceptor dropped with streams not yet accepted            | FIN         | RST(0) and STOP(0)             |
@@ -246,7 +253,8 @@ impl<T: TokioConn> MuxStream<T> {
     pub fn reset(&mut self, code: u64) -> MuxResult<()>;
 
     /// Abandon the peer's direction: discard unread data and send STOP.
-    /// Later reads return end-of-file.
+    /// Later reads return end-of-file. If the peer's direction has
+    /// already ended, only discards the unread data.
     pub fn stop_reading(&mut self, code: u64) -> MuxResult<()>;
 
     /// Both of the above, skipping a direction that has already ended.
