@@ -92,6 +92,8 @@ pub use mux::{mux_connection, MuxAcceptor, MuxConnector, MuxReadHalf, MuxStream,
 #[cfg(test)]
 mod flow_control_tests;
 #[cfg(test)]
+mod reset_tests;
+#[cfg(test)]
 mod split_tests;
 
 #[cfg(test)]

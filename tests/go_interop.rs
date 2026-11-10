@@ -70,6 +70,10 @@ struct Peer {
 }
 
 fn start_peer() -> Peer {
+    start_peer_with(ProtocolVersion::V2)
+}
+
+fn start_peer_with(version: ProtocolVersion) -> Peer {
     let mut child = Command::new(go_peer())
         .arg(WINDOW.to_string())
         .stdin(Stdio::piped())
@@ -79,7 +83,7 @@ fn start_peer() -> Peer {
         .unwrap();
     let carrier = tokio::io::join(child.stdout.take().unwrap(), child.stdin.take().unwrap());
     let (connector, _acceptor, worker) = MuxBuilder::client()
-        .with_version(ProtocolVersion::V2)
+        .with_version(version)
         .with_max_stream_buffer(NonZeroU32::new(WINDOW).unwrap())
         .with_connection(carrier)
         .build();
@@ -197,4 +201,23 @@ async fn go_writer_respects_our_window() {
         .expect("flood did not finish")
         .unwrap();
     assert!(received == pattern(LEN));
+}
+
+/// Version 255 is an extension of ours. The Go implementation must reject
+/// it at the first frame, rather than misbehave later.
+#[tokio::test]
+#[ignore = "needs a Go toolchain"]
+async fn go_rejects_version_255() {
+    let peer = start_peer_with(ProtocolVersion::V2WithReset);
+    let mut stream = peer.connector.connect().unwrap();
+    let _ = stream.write_all(b"e").await;
+    let _ = stream.flush().await;
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+        .await
+        .expect("the Go peer did not close the session");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "the Go peer answered a version-255 session: {read:?}"
+    );
 }
