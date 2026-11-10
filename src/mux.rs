@@ -124,14 +124,10 @@ impl<T: TokioConn> MuxConnector<T> {
         let frame = MuxFrame::new(MuxCommand::Sync, stream_id, Bytes::new());
         state.enqueue_frame_global(frame);
         state.notify_should_tx();
-        state.public_handles += 1;
+        // One public handle per half.
+        state.public_handles += 2;
 
-        let stream = MuxStream {
-            stream_id,
-            state: self.state.clone(),
-            read_buffer: None,
-        };
-        Ok(stream)
+        Ok(MuxStream::new(stream_id, self.state.clone()))
     }
 
     /// Orderly shutdown. Drains every frame already enqueued (per-stream
@@ -275,13 +271,9 @@ impl<T: TokioConn> Stream for MuxAcceptor<T> {
 
         if let Some(stream_id) = state.accept_queue.pop_front() {
             state.notify_rx_consumed();
-            state.public_handles += 1;
-            let stream = MuxStream {
-                stream_id,
-                state: self.state.clone(),
-                read_buffer: None,
-            };
-            Poll::Ready(Some(stream))
+            // One public handle per half.
+            state.public_handles += 2;
+            Poll::Ready(Some(MuxStream::new(stream_id, self.state.clone())))
         } else {
             state.register_accept_waker(cx);
             Poll::Pending
@@ -562,48 +554,143 @@ impl<T: TokioConn> Future for MuxWorker<T> {
 /// `TcpStream` would. Dropping it without `shutdown()` is fine — the
 /// stream's pending tx queue is moved to the global queue, and a FIN is
 /// enqueued unless its local write half or the session is already closed.
+///
+/// [`MuxStream::into_split`] separates it into its two halves, which can
+/// then be used, and dropped, independently.
 pub struct MuxStream<T: TokioConn> {
+    // Dropping a stream drops its halves, write half first.
+    write: MuxWriteHalf<T>,
+    read: MuxReadHalf<T>,
+}
+
+/// The reading half of a [`MuxStream`], from [`MuxStream::into_split`].
+///
+/// Dropping it discards the data not yet read, and any that arrives later.
+pub struct MuxReadHalf<T: TokioConn> {
     stream_id: u32,
     state: Arc<Mutex<MuxState<T>>>,
     read_buffer: Option<Bytes>,
 }
 
-impl<T: TokioConn> Drop for MuxStream<T> {
+/// The writing half of a [`MuxStream`], from [`MuxStream::into_split`].
+///
+/// Dropping it without `shutdown()` is fine, as for a whole `MuxStream`:
+/// data already accepted is still sent, followed by a FIN.
+pub struct MuxWriteHalf<T: TokioConn> {
+    stream_id: u32,
+    state: Arc<Mutex<MuxState<T>>>,
+}
+
+impl<T: TokioConn> MuxStream<T> {
+    /// Wrap a stream whose handle the session has just created. The caller
+    /// holds the state's lock, so it counts the two halves as public
+    /// handles itself.
+    fn new(stream_id: u32, state: Arc<Mutex<MuxState<T>>>) -> Self {
+        Self {
+            write: MuxWriteHalf {
+                stream_id,
+                state: state.clone(),
+            },
+            read: MuxReadHalf {
+                stream_id,
+                state,
+                read_buffer: None,
+            },
+        }
+    }
+
+    /// Separate the stream into its reading and writing halves, which may
+    /// be used from different tasks and dropped independently. Unlike
+    /// `tokio::io::split`, this needs no lock between the halves.
+    pub fn into_split(self) -> (MuxReadHalf<T>, MuxWriteHalf<T>) {
+        (self.read, self.write)
+    }
+
+    /// True once both stream directions have closed, the session has hard-
+    /// closed, or an idle timeout has fully closed the stream.
+    ///
+    /// A single FIN only closes one direction, so a half-closed stream still
+    /// returns `false` while it remains usable for reading or writing.
+    pub fn is_closed(&self) -> bool {
+        self.read
+            .state
+            .lock()
+            .is_stream_fully_closed(self.read.stream_id)
+    }
+
+    /// The 32-bit smux stream id assigned to this stream.
+    pub fn get_stream_id(&self) -> u32 {
+        self.read.stream_id
+    }
+}
+
+impl<T: TokioConn> MuxReadHalf<T> {
+    /// The 32-bit smux stream id assigned to this stream.
+    pub fn get_stream_id(&self) -> u32 {
+        self.stream_id
+    }
+}
+
+impl<T: TokioConn> MuxWriteHalf<T> {
+    /// The 32-bit smux stream id assigned to this stream.
+    pub fn get_stream_id(&self) -> u32 {
+        self.stream_id
+    }
+}
+
+impl<T: TokioConn> Drop for MuxReadHalf<T> {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        if !state.closed {
-            // Preserve every frame already accepted by poll_write even when a
-            // remote FIN raced with Drop. Whether we need to originate our own
-            // FIN is separate from whether accepted data must be drained.
-            let may_send_finish = !state.shutdown_requested;
-            let (drained, should_send_finish) = state
-                .handles
-                .get_mut(&self.stream_id)
-                .map(|h| {
-                    (
-                        std::mem::take(&mut h.tx_queue),
-                        may_send_finish && !h.write_closed,
-                    )
-                })
-                .unwrap_or_default();
-            state.tx_queue.extend(drained);
-            if should_send_finish {
-                state.enqueue_frame_global(MuxFrame::new(
-                    MuxCommand::Finish,
-                    self.stream_id,
-                    Bytes::new(),
-                ));
-            }
-            if should_send_finish || !state.tx_queue.is_empty() {
-                state.notify_should_tx();
-            }
-        }
-        state.remove_stream(self.stream_id);
+        state.release_read_half(self.stream_id);
+        state.release_half(self.stream_id);
+        state.dec_public_handles();
+    }
+}
+
+impl<T: TokioConn> Drop for MuxWriteHalf<T> {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.release_write_half(self.stream_id);
+        state.release_half(self.stream_id);
         state.dec_public_handles();
     }
 }
 
 impl<T: TokioConn> AsyncRead for MuxStream<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut io::ReadBuf<'_>,
+    ) -> Poll<StdIo::Result<()>> {
+        Pin::new(&mut self.read).poll_read(cx, buf)
+    }
+}
+
+impl<T: TokioConn> AsyncWrite for MuxStream<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, StdIo::Error>> {
+        Pin::new(&mut self.write).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StdIo::Error>> {
+        Pin::new(&mut self.write).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), StdIo::Error>> {
+        Pin::new(&mut self.write).poll_shutdown(cx)
+    }
+}
+
+impl<T: TokioConn> AsyncRead for MuxReadHalf<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -652,7 +739,7 @@ fn new_io_err(kind: ErrorKind, reason: &str) -> StdIo::Error {
     StdIo::Error::new(kind, reason)
 }
 
-impl<T: TokioConn> AsyncWrite for MuxStream<T> {
+impl<T: TokioConn> AsyncWrite for MuxWriteHalf<T> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -735,22 +822,6 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
     }
 }
 
-impl<T: TokioConn> MuxStream<T> {
-    /// True once both stream directions have closed, the session has hard-
-    /// closed, or an idle timeout has fully closed the stream.
-    ///
-    /// A single FIN only closes one direction, so a half-closed stream still
-    /// returns `false` while it remains usable for reading or writing.
-    pub fn is_closed(&self) -> bool {
-        self.state.lock().is_stream_fully_closed(self.stream_id)
-    }
-
-    /// The 32-bit smux stream id assigned to this stream.
-    pub fn get_stream_id(&self) -> u32 {
-        self.stream_id
-    }
-}
-
 struct StreamHandle {
     /// The peer sent FIN, so no more inbound payload is valid once the
     /// receive queue has been drained.
@@ -760,6 +831,9 @@ struct StreamHandle {
     /// The write half was closed by `MuxStream::poll_shutdown`, rather
     /// than by an idle timeout or the session closing.
     shut_down: bool,
+    /// How many of the stream's two halves (`MuxReadHalf`, `MuxWriteHalf`)
+    /// are still alive. The handle goes once both have been dropped.
+    halves: u8,
 
     tx_queue: VecDeque<MuxFrame>,
     tx_done_waker: Option<Waker>,
@@ -803,6 +877,7 @@ impl StreamHandle {
             read_closed: false,
             write_closed: false,
             shut_down: false,
+            halves: 2,
             tx_queue: VecDeque::new(),
             tx_done_waker: None,
             unflushed: false,
@@ -1003,6 +1078,57 @@ impl<T: TokioConn> MuxState<T> {
         self.handles.remove(&stream_id);
         // Rx queue may change
         self.notify_rx_consumed();
+    }
+
+    /// The writing half of a stream has been dropped. Data it had already
+    /// queued is still sent, followed by a FIN unless its write half or the
+    /// session has already been closed.
+    fn release_write_half(&mut self, stream_id: u32) {
+        if self.closed {
+            return;
+        }
+        // Preserve every frame already accepted by poll_write even when a
+        // remote FIN raced with Drop. Whether we need to originate our own
+        // FIN is separate from whether accepted data must be drained.
+        let may_send_finish = !self.shutdown_requested;
+        let (drained, should_send_finish) = self
+            .handles
+            .get_mut(&stream_id)
+            .map(|h| {
+                let should_send_finish = may_send_finish && !h.write_closed;
+                h.write_closed = true;
+                (std::mem::take(&mut h.tx_queue), should_send_finish)
+            })
+            .unwrap_or_default();
+        self.tx_queue.extend(drained);
+        if should_send_finish {
+            self.enqueue_frame_global(MuxFrame::new(MuxCommand::Finish, stream_id, Bytes::new()));
+        }
+        if should_send_finish || !self.tx_queue.is_empty() {
+            self.notify_should_tx();
+        }
+    }
+
+    /// The reading half of a stream has been dropped: discard what it
+    /// hasn't read, and whatever the peer sends from now on.
+    fn release_read_half(&mut self, stream_id: u32) {
+        if let Some(h) = self.handles.get_mut(&stream_id) {
+            h.read_closed = true;
+            h.rx_queue.clear();
+            h.rx_buffered = 0;
+        }
+        self.notify_rx_consumed();
+    }
+
+    /// One half of a stream has gone; forget the stream once both have.
+    fn release_half(&mut self, stream_id: u32) {
+        let Some(h) = self.handles.get_mut(&stream_id) else {
+            return;
+        };
+        h.halves -= 1;
+        if h.halves == 0 {
+            self.remove_stream(stream_id);
+        }
     }
 
     fn send_finish(&mut self, stream_id: u32) {

@@ -78,10 +78,12 @@ pub(crate) mod mux;
 
 pub use builder::MuxBuilder;
 pub use config::{MuxConfig, ProtocolVersion, StreamIdType};
-pub use mux::{mux_connection, MuxAcceptor, MuxConnector, MuxStream};
+pub use mux::{mux_connection, MuxAcceptor, MuxConnector, MuxReadHalf, MuxStream, MuxWriteHalf};
 
 #[cfg(test)]
 mod flow_control_tests;
+#[cfg(test)]
+mod split_tests;
 
 #[cfg(test)]
 mod tests {
