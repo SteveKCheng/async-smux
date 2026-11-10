@@ -21,7 +21,7 @@ use tokio::{
 use tokio_util::codec::Framed;
 
 use crate::{
-    config::{MuxConfig, StreamIdType},
+    config::{MuxConfig, ProtocolVersion, StreamIdType, INITIAL_PEER_WINDOW},
     error::{MuxError, MuxResult},
     frame::{MuxCodec, MuxCommand, MuxFrame, MAX_PAYLOAD_SIZE},
 };
@@ -507,9 +507,14 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
                 }
                 MuxCommand::Push => {
                     let stream_id = frame.header.stream_id;
-                    if !state.recv_push(frame) {
+                    if !state.recv_push(frame).inspect_err(|_| state.hard_close())? {
                         state.send_finish(stream_id);
                     }
+                }
+                MuxCommand::Update => {
+                    state
+                        .recv_update(&frame)
+                        .inspect_err(|_| state.hard_close())?;
                 }
                 MuxCommand::Nop => {
                     // Do nothing
@@ -665,16 +670,20 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
             )));
         }
 
-        ready!(state.poll_stream_write_ready(cx, self.stream_id)).map_err(mux_to_io_err)?;
+        let window =
+            ready!(state.poll_stream_write_ready(cx, self.stream_id)).map_err(mux_to_io_err)?;
 
         // Enqueue at most one frame per poll_write so the per-stream
         // back-pressure check above is consulted between frames. Otherwise
         // a single large write_all call would push the tx_queue arbitrarily
         // far past max_tx_queue. AsyncWriteExt::write_all loops until all
         // bytes are accepted, so caller semantics are preserved.
-        let len = buf.len().min(MAX_PAYLOAD_SIZE);
+        let len = buf.len().min(MAX_PAYLOAD_SIZE).min(window);
         let payload = Bytes::copy_from_slice(&buf[..len]);
         let frame = MuxFrame::new(MuxCommand::Push, self.stream_id, payload);
+        if let Some(h) = state.handles.get_mut(&self.stream_id) {
+            h.num_written = h.num_written.wrapping_add(len as u32);
+        }
         state.enqueue_frame_stream(self.stream_id, frame);
         state.notify_should_tx();
         Poll::Ready(Ok(len))
@@ -755,6 +764,26 @@ struct StreamHandle {
     rx_queue: VecDeque<MuxFrame>,
     rx_ready_waker: Option<Waker>,
 
+    // v2 flow control, receiving side. Data counts as consumed once it
+    // leaves rx_queue, which is at most one frame ahead of the reader.
+    /// Payload bytes waiting in rx_queue.
+    rx_buffered: usize,
+    /// Payload bytes taken out of rx_queue so far, modulo 2^32. This is
+    /// the "consumed" counter our window updates report.
+    num_read: u32,
+    /// Bytes consumed since our last window update.
+    unannounced_read: u32,
+    /// Whether we have sent a window update yet.
+    window_announced: bool,
+
+    // v2 flow control, sending side.
+    /// Payload bytes accepted by poll_write so far, modulo 2^32.
+    num_written: u32,
+    /// The peer's "consumed" counter from its last window update.
+    peer_consumed: u32,
+    /// The peer's window from its last window update.
+    peer_window: u32,
+
     last_active: Instant,
 }
 
@@ -769,6 +798,13 @@ impl StreamHandle {
             flush_requested: false,
             rx_queue: VecDeque::new(),
             rx_ready_waker: None,
+            rx_buffered: 0,
+            num_read: 0,
+            unannounced_read: 0,
+            window_announced: false,
+            num_written: 0,
+            peer_consumed: 0,
+            peer_window: INITIAL_PEER_WINDOW,
             last_active: Instant::now(),
         }
     }
@@ -776,6 +812,15 @@ impl StreamHandle {
     #[inline]
     fn is_fully_closed(&self) -> bool {
         self.read_closed && self.write_closed
+    }
+
+    /// How many more bytes the peer's window lets us send. The counters
+    /// wrap around, so the difference is taken modulo 2^32, as in golang's
+    /// smux library.
+    #[inline]
+    fn available_send_window(&self) -> usize {
+        let inflight = self.num_written.wrapping_sub(self.peer_consumed);
+        self.peer_window.saturating_sub(inflight) as usize
     }
 
     #[inline]
@@ -854,6 +899,10 @@ struct MuxState<T: TokioConn> {
 
     max_tx_queue: usize,
     max_rx_queue: usize,
+
+    version: ProtocolVersion,
+    /// Receive window of each stream (v2).
+    max_stream_buffer: u32,
 }
 
 impl<T: TokioConn> Drop for MuxState<T> {
@@ -896,6 +945,8 @@ impl<T: TokioConn> MuxState<T> {
             rx_backpressured: false,
             max_tx_queue: config.max_tx_queue.get(),
             max_rx_queue: config.max_rx_queue.get(),
+            version: config.version,
+            max_stream_buffer: config.max_stream_buffer.get().min(i32::MAX as u32),
         }
     }
 
@@ -1025,7 +1076,15 @@ impl<T: TokioConn> MuxState<T> {
         }
     }
 
-    fn recv_push(&mut self, frame: MuxFrame) -> bool {
+    /// Queue a PSH payload for its stream. Returns false if the stream is
+    /// unknown, and an error if the peer overran the stream's window.
+    fn recv_push(&mut self, frame: MuxFrame) -> MuxResult<bool> {
+        // The peer may send as much as the window it last heard of, which
+        // is our configured window, or before our first update the 256 KiB
+        // it assumes. Data counts as consumed once it leaves rx_queue, so
+        // that much is also the most rx_queue can legitimately hold.
+        let rx_limit = self.max_stream_buffer.max(INITIAL_PEER_WINDOW) as usize;
+        let flow_control = self.version.has_flow_control();
         if let Some(handle) = self.handles.get_mut(&frame.header.stream_id) {
             // FIN from the peer closes only our read direction. Discard PSH
             // after that EOF boundary, but continue accepting peer responses
@@ -1035,23 +1094,51 @@ impl<T: TokioConn> MuxState<T> {
                 // usable. Silently discard this protocol-invalid late data;
                 // replying with FIN here would close that write half on the
                 // wire while the local API continued accepting writes.
-                return true;
+                return Ok(true);
             }
             handle.last_active = Instant::now();
             // A zero-length PSH carries no data. Queuing it would make a
             // non-empty AsyncRead return zero and falsely signal EOF.
             if !frame.payload.is_empty() {
+                handle.rx_buffered += frame.payload.len();
+                if flow_control && handle.rx_buffered > rx_limit {
+                    return Err(MuxError::WindowExceeded(frame.header.stream_id));
+                }
                 handle.rx_queue.push_back(frame);
                 handle.notify_rx_ready();
             }
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
+    }
+
+    /// Apply a peer's window update and wake the stream's writer.
+    fn recv_update(&mut self, frame: &MuxFrame) -> MuxResult<()> {
+        let stream_id = frame.header.stream_id;
+        let (consumed, window) = frame.update_fields();
+        // Updates for streams we no longer track are ignored, as in the 
+        // golang's smux library.
+        if let Some(handle) = self.handles.get_mut(&stream_id) {
+            // The peer cannot have consumed more than we have sent. Since
+            // the counters wrap, "more" means a negative 32-bit difference.
+            if (handle.num_written.wrapping_sub(consumed) as i32) < 0 {
+                return Err(MuxError::InvalidWindowUpdate(stream_id));
+            }
+            handle.peer_consumed = consumed;
+            handle.peer_window = window;
+            handle.notify_tx_done();
+        }
+        Ok(())
     }
 
     #[inline]
     fn get_rx_pending(&mut self) -> usize {
+        // With flow control, each stream's window bounds its own data, so
+        // only streams waiting to be accepted use the session-wide budget.
+        if self.version.has_flow_control() {
+            return self.accept_queue.len();
+        }
         self.accept_queue.len()
             + self
                 .handles
@@ -1147,6 +1234,10 @@ impl<T: TokioConn> MuxState<T> {
             return Poll::Ready(Ok(None));
         };
         if let Some(f) = handle.rx_queue.pop_front() {
+            handle.rx_buffered -= f.payload.len();
+            if self.version.has_flow_control() {
+                self.account_read(stream_id, f.payload.len() as u32);
+            }
             self.notify_rx_consumed(); // Rx queue packet consumed
             Poll::Ready(Ok(Some(f)))
         } else if self.closed {
@@ -1161,7 +1252,41 @@ impl<T: TokioConn> MuxState<T> {
         }
     }
 
-    fn poll_stream_write_ready(&mut self, cx: &Context<'_>, stream_id: u32) -> Poll<MuxResult<()>> {
+    /// Count `len` bytes as consumed, and send a window update once half of
+    /// the window has been consumed since the last one, or on the first
+    /// read, as golang's smux library does: the peer starts out assuming a 
+    /// window of size 256 KiB, which may differ from ours.
+    fn account_read(&mut self, stream_id: u32, len: u32) {
+        let threshold = self.max_stream_buffer / 2;
+        let window = self.max_stream_buffer;
+        let Some(handle) = self.handles.get_mut(&stream_id) else {
+            return;
+        };
+        handle.num_read = handle.num_read.wrapping_add(len);
+        handle.unannounced_read = handle.unannounced_read.saturating_add(len);
+        // After the peer's FIN no more data is coming, so the window no
+        // longer matters. This also covers a closing session, which marks
+        // every stream read-closed before draining the tx queue.
+        if handle.read_closed {
+            return;
+        }
+        if handle.unannounced_read >= threshold || !handle.window_announced {
+            handle.unannounced_read = 0;
+            handle.window_announced = true;
+            let frame = MuxFrame::new_update(stream_id, handle.num_read, window);
+            // Control queue: an update must not wait behind our own data.
+            self.enqueue_frame_global(frame);
+            self.notify_should_tx();
+        }
+    }
+
+    /// Wait until the stream may take more data, and return how many
+    /// bytes it may take: unlimited with v1, the peer's window with v2.
+    fn poll_stream_write_ready(
+        &mut self,
+        cx: &Context<'_>,
+        stream_id: u32,
+    ) -> Poll<MuxResult<usize>> {
         self.check_accepting_work()?;
         debug_assert!(
             self.handles.contains_key(&stream_id),
@@ -1178,8 +1303,17 @@ impl<T: TokioConn> MuxState<T> {
             // Notify the worker to transfer data now
             self.notify_should_tx();
             Poll::Pending
+        } else if self.version.has_flow_control() {
+            match handle.available_send_window() {
+                0 => {
+                    // The peer's window is full; recv_update wakes us.
+                    handle.register_tx_done_waker(cx);
+                    Poll::Pending
+                }
+                window => Poll::Ready(Ok(window)),
+            }
         } else {
-            Poll::Ready(Ok(()))
+            Poll::Ready(Ok(usize::MAX))
         }
     }
 
@@ -1459,8 +1593,8 @@ impl<T: TokioConn> MuxState<T> {
 #[cfg(test)]
 mod alloc_tests {
     use super::*;
-    use crate::config::{ProtocolVersion, StreamIdType};
-    use std::num::{NonZeroUsize, Wrapping};
+    use crate::config::StreamIdType;
+    use std::num::{NonZeroU32, NonZeroUsize, Wrapping};
 
     fn fresh_state(stream_id_type: StreamIdType) -> MuxState<tokio::io::DuplexStream> {
         // Construct a state via the same constructor that mux_connection
@@ -1474,6 +1608,7 @@ mod alloc_tests {
             idle_timeout: None,
             max_tx_queue: NonZeroUsize::new(1024).unwrap(),
             max_rx_queue: NonZeroUsize::new(1024).unwrap(),
+            max_stream_buffer: NonZeroU32::new(INITIAL_PEER_WINDOW).unwrap(),
         };
         MuxState::new(Framed::new(a, MuxCodec::new(cfg.version)), cfg)
     }
@@ -1504,11 +1639,13 @@ mod alloc_tests {
         let mut s = fresh_state(StreamIdType::Odd);
         let stream_id = 2;
         s.process_sync(stream_id, Direction::Rx).unwrap();
-        assert!(s.recv_push(MuxFrame::new(
-            MuxCommand::Push,
-            stream_id,
-            Bytes::from_static(b"queued")
-        )));
+        assert!(s
+            .recv_push(MuxFrame::new(
+                MuxCommand::Push,
+                stream_id,
+                Bytes::from_static(b"queued")
+            ))
+            .unwrap());
 
         s.mark_read_closed(stream_id);
 

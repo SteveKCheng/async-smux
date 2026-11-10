@@ -5,10 +5,10 @@
 //! call `with_connection(...)` followed by `build()` to obtain the
 //! `(MuxConnector, MuxAcceptor, MuxWorker)` triple.
 
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use crate::{
-    config::{MuxConfig, ProtocolVersion, StreamIdType},
+    config::{MuxConfig, ProtocolVersion, StreamIdType, INITIAL_PEER_WINDOW},
     mux::{MuxWorker, TokioConn},
     mux_connection, MuxAcceptor, MuxConnector,
 };
@@ -44,6 +44,7 @@ impl MuxBuilder<Begin> {
                     idle_timeout: None,
                     max_tx_queue: NonZeroUsize::new(1024).unwrap(),
                     max_rx_queue: NonZeroUsize::new(1024).unwrap(),
+                    max_stream_buffer: NonZeroU32::new(INITIAL_PEER_WINDOW).unwrap(),
                 },
             },
         }
@@ -61,6 +62,7 @@ impl MuxBuilder<Begin> {
                     idle_timeout: None,
                     max_tx_queue: NonZeroUsize::new(1024).unwrap(),
                     max_rx_queue: NonZeroUsize::new(1024).unwrap(),
+                    max_stream_buffer: NonZeroU32::new(INITIAL_PEER_WINDOW).unwrap(),
                 },
             },
         }
@@ -72,6 +74,15 @@ impl MuxBuilder<WithConfig> {
     /// defaults to [`ProtocolVersion::V1`].
     pub fn with_version(&mut self, version: ProtocolVersion) -> &mut Self {
         self.state.config.version = version;
+        self
+    }
+
+    /// Receive window of each stream, in bytes, with
+    /// [`ProtocolVersion::V2`]; ignored with V1. Defaults to 256 KiB, the
+    /// window a peer assumes until it hears otherwise. Values above
+    /// `i32::MAX` are clamped.
+    pub fn with_max_stream_buffer(&mut self, size: NonZeroU32) -> &mut Self {
+        self.state.config.max_stream_buffer = size;
         self
     }
 

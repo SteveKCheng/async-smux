@@ -1,4 +1,9 @@
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+
+/// The window a v2 sender assumes before the receiver's first window
+/// update, as in the golang implementation. It is also the default
+/// [`MuxConfig::max_stream_buffer`].
+pub const INITIAL_PEER_WINDOW: u32 = 256 * 1024;
 
 /// The smux protocol spoken on the carrier. smux has no version
 /// negotiation, so both ends must be configured alike; a frame with a
@@ -11,6 +16,12 @@ pub enum ProtocolVersion {
     /// out, the carrier stops being read, and every stream stalls.
     #[default]
     V1,
+    /// Protocol version 2, from golang's smux library.  Version 2 
+    /// supplements Version 1 with per-stream flow control.  A stream 
+    /// whose reader stops only stalls its own writer.
+    /// The receiver sends a new frame type, UPD, to inform the sender
+    /// of its current receive window.
+    V2,
 }
 
 impl ProtocolVersion {
@@ -18,6 +29,15 @@ impl ProtocolVersion {
     pub(crate) fn wire_byte(self) -> u8 {
         match self {
             ProtocolVersion::V1 => 1,
+            ProtocolVersion::V2 => 2,
+        }
+    }
+
+    /// Whether streams are flow-controlled with UPD frames.
+    pub(crate) fn has_flow_control(self) -> bool {
+        match self {
+            ProtocolVersion::V1 => false,
+            ProtocolVersion::V2 => true,
         }
     }
 }
@@ -57,5 +77,13 @@ pub struct MuxConfig {
     /// Backpressure threshold for inbound frames and unaccepted streams
     /// across the session. Dead-peer detection is suspended while this
     /// budget is exhausted because the carrier is intentionally not polled.
+    ///
+    /// With [`ProtocolVersion::V2`], stream data doesn't count: each
+    /// stream's window bounds it instead. Only unaccepted streams do.
     pub max_rx_queue: NonZeroUsize,
+    /// Receive window of each stream, in bytes, with
+    /// [`ProtocolVersion::V2`]. A window update is sent each time the
+    /// reader has consumed half of it. Values above `i32::MAX` are
+    /// clamped, since the golang implementation treats the window as signed.
+    pub max_stream_buffer: NonZeroU32,
 }

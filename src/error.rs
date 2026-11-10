@@ -12,6 +12,8 @@ pub enum MuxError {
     PayloadTooLarge(usize),
     #[error("Control frame must have empty payload, got length {0}")]
     InvalidControlFramePayload(u16),
+    #[error("UPD frame must carry 8 bytes, got length {0}")]
+    InvalidUpdatePayload(u16),
     #[error("Reserved stream id {0}")]
     ReservedStreamId(u32),
     #[error("NOP frame must use stream id 0, got {0}")]
@@ -21,6 +23,11 @@ pub enum MuxError {
 
     #[error("Invalid stream ID from peer: {0}, local stream ID type: {1:?}")]
     InvalidPeerStreamIdType(u32, StreamIdType),
+
+    #[error("Peer acknowledged more data than was sent on stream {0}")]
+    InvalidWindowUpdate(u32),
+    #[error("Peer overran the receive window of stream {0}")]
+    WindowExceeded(u32),
 
     #[error("Too many streams")]
     TooManyStreams,

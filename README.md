@@ -83,10 +83,15 @@ EOF to send data after receiving it.
 ## Configuration
 
 ```rust,ignore
-use async_smux::MuxBuilder;
-use std::num::{NonZeroU64, NonZeroUsize};
+use async_smux::{MuxBuilder, ProtocolVersion};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 let (connector, acceptor, worker) = MuxBuilder::server()
+    // Protocol version 2 adds per-stream flow control. Both ends must
+    // use the same version; smux does not negotiate it.
+    .with_version(ProtocolVersion::V2)
+    // Receive window per stream (v2 only). Defaults to 256 KiB.
+    .with_max_stream_buffer(NonZeroU32::new(256 * 1024).unwrap())
     // Send a NOP frame every N seconds to keep the connection alive.
     .with_keep_alive_interval(NonZeroU64::new(15).unwrap())
     // If we don't see any frame from the peer for this many seconds,
@@ -97,8 +102,9 @@ let (connector, acceptor, worker) = MuxBuilder::server()
     // recent traffic.
     .with_idle_timeout(NonZeroU64::new(60).unwrap())
     // Backpressure thresholds: cap queued tx frames and the combined
-    // inbound-frame/unaccepted-stream backlog. Keep-alive expiry pauses
-    // while the RX budget deliberately prevents carrier reads.
+    // inbound-frame/unaccepted-stream backlog (with v2, only unaccepted
+    // streams). Keep-alive expiry pauses while the RX budget
+    // deliberately prevents carrier reads.
     .with_max_tx_queue(NonZeroUsize::new(1024).unwrap())
     .with_max_rx_queue(NonZeroUsize::new(1024).unwrap())
     .with_connection(connection)
@@ -108,17 +114,34 @@ let (connector, acceptor, worker) = MuxBuilder::server()
 All of these knobs are optional. Keep-alive and idle timeout are off
 unless explicitly enabled.
 
-## Frame format (smux v1)
+## Protocol versions
+
+With version 1 (the default), streams have no flow control of their
+own. Inbound data waits in a session-wide budget (`max_rx_queue`), and
+when that is used up, the carrier stops being read: a single stream
+whose reader has stopped stalls every other stream.
+
+Version 2, as in the Go implementation (`Config.Version = 2`), gives
+each stream a window. The receiver reports with UPD frames how much it
+has consumed, and a writer waits once the peer's window is full, so a
+stalled stream only stalls its own writer. A peer that sends more than
+the window is a protocol error. See `docs/flow-control.md`.
+
+## Frame format
 
 ```text
 VERSION(1B) | CMD(1B) | LENGTH(2B LE) | STREAMID(4B LE) | DATA(LENGTH)
 
-VERSION: 1
+VERSION: 1 or 2, as configured; any other value is a protocol error
 CMD:
     SYN(0)  open stream  (LENGTH must be 0)
     FIN(1)  close sender's write direction (LENGTH must be 0)
     PSH(2)  payload
     NOP(3)  keep-alive   (LENGTH must be 0; STREAMID is 0)
+    UPD(4)  window update, v2 only (LENGTH must be 8):
+            CONSUMED(4B LE) | WINDOW(4B LE)
+            CONSUMED counts the bytes read from the stream so far,
+            modulo 2^32; WINDOW is the receiver's window
 ```
 
 Stream id 0 is reserved for NOP; the library never hands it out and

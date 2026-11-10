@@ -57,9 +57,18 @@
 //! # Configuration
 //!
 //! See [`MuxBuilder`] for the available knobs: `with_version`,
-//! `with_keep_alive_interval`, `with_keep_alive_timeout`,
-//! `with_idle_timeout`, `with_max_tx_queue`, `with_max_rx_queue`.
-//! Keep-alive and idle timeout are off unless explicitly enabled.
+//! `with_max_stream_buffer`, `with_keep_alive_interval`,
+//! `with_keep_alive_timeout`, `with_idle_timeout`, `with_max_tx_queue`,
+//! `with_max_rx_queue`. Keep-alive and idle timeout are off unless
+//! explicitly enabled.
+//!
+//! # Flow control
+//!
+//! [`ProtocolVersion::V2`] adds per-stream flow control, compatible with
+//! the protocol version 2 from golang's smux library: a stream whose reader 
+//! has stopped only stalls its own writer. With the default,
+//! [`ProtocolVersion::V1`], it stalls the whole session once the receive
+//! budget is used up. Both ends must be configured with the same version.
 
 pub mod builder;
 pub mod config;
