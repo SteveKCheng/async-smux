@@ -1117,7 +1117,7 @@ impl<T: TokioConn> MuxState<T> {
     fn recv_update(&mut self, frame: &MuxFrame) -> MuxResult<()> {
         let stream_id = frame.header.stream_id;
         let (consumed, window) = frame.update_fields();
-        // Updates for streams we no longer track are ignored, as in the 
+        // Updates for streams we no longer track are ignored, as in the
         // golang's smux library.
         if let Some(handle) = self.handles.get_mut(&stream_id) {
             // The peer cannot have consumed more than we have sent. Since
@@ -1254,7 +1254,7 @@ impl<T: TokioConn> MuxState<T> {
 
     /// Count `len` bytes as consumed, and send a window update once half of
     /// the window has been consumed since the last one, or on the first
-    /// read, as golang's smux library does: the peer starts out assuming a 
+    /// read, as golang's smux library does: the peer starts out assuming a
     /// window of size 256 KiB, which may differ from ours.
     fn account_read(&mut self, stream_id: u32, len: u32) {
         let threshold = self.max_stream_buffer / 2;
@@ -1654,6 +1654,39 @@ mod alloc_tests {
             1,
             "unread payload stopped counting as soon as FIN arrived"
         );
+    }
+
+    #[test]
+    fn send_window_wraps_around() {
+        let mut h = StreamHandle::new();
+        h.num_written = 10;
+        h.peer_consumed = u32::MAX - 5;
+        h.peer_window = 100;
+        assert_eq!(
+            h.available_send_window(),
+            84,
+            "16 bytes are in flight across the wrap"
+        );
+        h.peer_window = 16;
+        assert_eq!(h.available_send_window(), 0);
+    }
+
+    #[test]
+    fn window_update_is_checked_across_wrap() {
+        let mut s = fresh_state(StreamIdType::Odd);
+        let stream_id = 2;
+        s.process_sync(stream_id, Direction::Rx).unwrap();
+        s.handles.get_mut(&stream_id).unwrap().num_written = 10;
+
+        let behind = MuxFrame::new_update(stream_id, u32::MAX - 5, 1000);
+        s.recv_update(&behind).unwrap();
+        assert_eq!(s.handles[&stream_id].available_send_window(), 1000 - 16);
+
+        let ahead = MuxFrame::new_update(stream_id, 11, 1000);
+        assert!(matches!(
+            s.recv_update(&ahead),
+            Err(MuxError::InvalidWindowUpdate(2))
+        ));
     }
 
     #[test]

@@ -65,7 +65,7 @@
 //! # Flow control
 //!
 //! [`ProtocolVersion::V2`] adds per-stream flow control, compatible with
-//! the protocol version 2 from golang's smux library: a stream whose reader 
+//! the protocol version 2 from golang's smux library: a stream whose reader
 //! has stopped only stalls its own writer. With the default,
 //! [`ProtocolVersion::V1`], it stalls the whole session once the receive
 //! budget is used up. Both ends must be configured with the same version.
@@ -79,6 +79,9 @@ pub(crate) mod mux;
 pub use builder::MuxBuilder;
 pub use config::{MuxConfig, ProtocolVersion, StreamIdType};
 pub use mux::{mux_connection, MuxAcceptor, MuxConnector, MuxStream};
+
+#[cfg(test)]
+mod flow_control_tests;
 
 #[cfg(test)]
 mod tests {

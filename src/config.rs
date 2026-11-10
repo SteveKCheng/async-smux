@@ -16,8 +16,8 @@ pub enum ProtocolVersion {
     /// out, the carrier stops being read, and every stream stalls.
     #[default]
     V1,
-    /// Protocol version 2, from golang's smux library.  Version 2 
-    /// supplements Version 1 with per-stream flow control.  A stream 
+    /// Protocol version 2, from golang's smux library.  Version 2
+    /// supplements Version 1 with per-stream flow control.  A stream
     /// whose reader stops only stalls its own writer.
     /// The receiver sends a new frame type, UPD, to inform the sender
     /// of its current receive window.
