@@ -11,7 +11,7 @@ Status on the `flow-control-v2` branch:
 | Issue                                 | Status                         |
 |---------------------------------------|--------------------------------|
 | No per-stream flow control            | implemented as protocol v2     |
-| `poll_flush` fails after shutdown     | not fixed yet (§2)             |
+| `poll_flush` fails after shutdown     | fixed (§2)                     |
 | No way to abort a stream (RST)        | not started (§3)               |
 
 ## 1. Flow control
@@ -202,10 +202,16 @@ Flushing a half-closed stream should succeed once everything queued,
 FIN included, is on the carrier; only `poll_write` should fail. Shion
 works around it with a wrapper (`shion_mux::Stream`) that remembers that
 shutdown has started and turns a later flush into another
-`poll_shutdown`. The fix in `MuxStream::poll_flush` is small: return `Ok`
-rather than `BrokenPipe` when the stream's own write half was closed by
-`poll_shutdown` (as opposed to by a session close). Not done on this
-branch yet.
+`poll_shutdown`.
+
+**Fixed:** each stream now records whether its own `poll_shutdown` closed
+the write half. If so, `poll_flush` returns `Ok` once the queue, FIN
+included, has drained. A write half closed any other way, by an idle
+timeout or by the session closing, still makes `poll_flush` fail as
+before, and `poll_write` fails after a shutdown either way. With this fix,
+Shion's wrapper is no longer needed. The tests are
+`test_framed_close_after_pending_shutdown` (closing a `FramedWrite` while
+the FIN is in flight) and `test_flush_after_shutdown_succeeds`.
 
 ## 3. No way to abort a stream
 

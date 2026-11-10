@@ -582,6 +582,68 @@ mod tests {
         assert_eq!(response, b"response after accept");
     }
 
+    // BUG: once poll_shutdown had queued FIN, poll_flush failed with
+    // BrokenPipe as soon as the FIN had been written. Framed::close flushes
+    // and then shuts down, and polls both again while the shutdown is
+    // pending, so closing a Framed over a MuxStream failed.
+    #[tokio::test]
+    async fn test_framed_close_after_pending_shutdown() {
+        use futures::SinkExt;
+        use tokio_util::codec::{BytesCodec, FramedWrite};
+
+        // A one-byte carrier keeps the FIN in flight long enough for
+        // poll_shutdown to return Pending.
+        let (a, b) = tokio::io::duplex(1);
+        let (connector, _acceptor_a, worker_a) = MuxBuilder::client().with_connection(a).build();
+        let (_connector_b, mut acceptor_b, worker_b) =
+            MuxBuilder::server().with_connection(b).build();
+        tokio::spawn(worker_a);
+        tokio::spawn(worker_b);
+
+        let mut framed = FramedWrite::new(connector.connect().unwrap(), BytesCodec::new());
+        let mut peer = acceptor_b.accept().await.unwrap();
+        let reader = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            peer.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        framed
+            .send(bytes::Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            SinkExt::<bytes::Bytes>::close(&mut framed),
+        )
+        .await
+        .expect("close timed out")
+        .expect("closing a Framed over a shut-down stream failed");
+        assert_eq!(reader.await.unwrap(), b"hello".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_flush_after_shutdown_succeeds() {
+        let (mut a, mut b) = get_duplex_mux_pair().await;
+        a.write_all(b"data").await.unwrap();
+        a.shutdown().await.unwrap();
+        a.flush()
+            .await
+            .expect("flush after the stream's own shutdown failed");
+
+        // Still fine once the peer has closed its half too.
+        b.shutdown().await.unwrap();
+        let mut buf = Vec::new();
+        a.read_to_end(&mut buf).await.unwrap();
+        a.flush().await.unwrap();
+
+        // Writing is what must fail after shutdown.
+        assert_eq!(
+            a.write(b"late").await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
     #[tokio::test]
     async fn test_half_close_repeated_shutdown_sends_one_fin() {
         let (a, mut peer) = tokio::io::duplex(1024);

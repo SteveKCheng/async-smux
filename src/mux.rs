@@ -698,7 +698,11 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(mux_to_io_err(e))),
             Poll::Pending => return Poll::Pending,
         }
-        if state.is_write_closed(self.stream_id) {
+        // After the stream's own shutdown, flushing only has to get the
+        // queued FIN out, which is done by now. Framed::close, for one,
+        // flushes again while a shutdown is pending. Only a write half
+        // closed some other way is reported.
+        if state.is_write_closed(self.stream_id) && !state.is_shut_down(self.stream_id) {
             return Poll::Ready(Err(new_io_err(
                 StdIo::ErrorKind::BrokenPipe,
                 "stream tx is already closed",
@@ -719,6 +723,9 @@ impl<T: TokioConn> AsyncWrite for MuxStream<T> {
             }
 
             state.mark_write_closed(self.stream_id);
+            if let Some(h) = state.handles.get_mut(&self.stream_id) {
+                h.shut_down = true;
+            }
             state.enqueue_frame_stream(
                 self.stream_id,
                 MuxFrame::new(MuxCommand::Finish, self.stream_id, Bytes::new()),
@@ -750,6 +757,9 @@ struct StreamHandle {
     read_closed: bool,
     /// We sent (or queued) FIN, so no more writes may be accepted locally.
     write_closed: bool,
+    /// The write half was closed by `MuxStream::poll_shutdown`, rather
+    /// than by an idle timeout or the session closing.
+    shut_down: bool,
 
     tx_queue: VecDeque<MuxFrame>,
     tx_done_waker: Option<Waker>,
@@ -792,6 +802,7 @@ impl StreamHandle {
         Self {
             read_closed: false,
             write_closed: false,
+            shut_down: false,
             tx_queue: VecDeque::new(),
             tx_done_waker: None,
             unflushed: false,
@@ -1188,6 +1199,10 @@ impl<T: TokioConn> MuxState<T> {
         self.closed
             || self.shutdown_requested
             || self.handles.get(&stream_id).is_none_or(|h| h.write_closed)
+    }
+
+    fn is_shut_down(&self, stream_id: u32) -> bool {
+        self.handles.get(&stream_id).is_some_and(|h| h.shut_down)
     }
 
     fn poll_next_frame(&mut self, cx: &mut Context<'_>) -> Poll<MuxResult<MuxFrame>> {
