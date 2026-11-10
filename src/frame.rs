@@ -12,6 +12,8 @@ pub const HEADER_SIZE: usize = 8;
 pub const MAX_PAYLOAD_SIZE: usize = 0xffff;
 /// Payload size of a v2 UPD frame: consumed bytes, then window size.
 pub const UPD_PAYLOAD_SIZE: usize = 8;
+/// Payload size of RST and STOP frames: a 64-bit error code.
+pub const ERROR_CODE_PAYLOAD_SIZE: usize = 8;
 
 #[derive(Eq, PartialEq, Debug, Clone, Copy)]
 pub(crate) enum MuxCommand {
@@ -22,6 +24,12 @@ pub(crate) enum MuxCommand {
     /// Window update (v2): the receiver reports how many bytes it has
     /// consumed and how large its window is.
     Update = 4,
+    /// Reset (version 255): the writer abandons its direction of the
+    /// stream. Carries an error code.
+    Reset = 5,
+    /// Stop sending (version 255): the reader asks the writer to abandon
+    /// its direction of the stream. Carries an error code.
+    StopSending = 6,
 }
 
 impl TryFrom<u8> for MuxCommand {
@@ -34,6 +42,8 @@ impl TryFrom<u8> for MuxCommand {
             2 => Ok(MuxCommand::Push),
             3 => Ok(MuxCommand::Nop),
             4 => Ok(MuxCommand::Update),
+            5 => Ok(MuxCommand::Reset),
+            6 => Ok(MuxCommand::StopSending),
             _ => Err(MuxError::InvalidCommand(value)),
         }
     }
@@ -63,7 +73,12 @@ impl MuxFrameHeader {
             return Err(MuxError::InvalidVersion(wire_version));
         }
         let command = MuxCommand::try_from(cursor.get_u8())?;
-        if command == MuxCommand::Update && !version.has_flow_control() {
+        let supported = match command {
+            MuxCommand::Update => version.has_flow_control(),
+            MuxCommand::Reset | MuxCommand::StopSending => version.has_reset(),
+            _ => true,
+        };
+        if !supported {
             return Err(MuxError::InvalidCommand(command as u8));
         }
         let length = cursor.get_u16_le();
@@ -104,6 +119,23 @@ impl MuxFrame {
         Self::new(MuxCommand::Update, stream_id, payload.freeze())
     }
 
+    /// An RST or STOP frame carrying `code`.
+    pub fn new_with_error_code(command: MuxCommand, stream_id: u32, code: u64) -> Self {
+        let mut payload = BytesMut::with_capacity(ERROR_CODE_PAYLOAD_SIZE);
+        payload.put_u64_le(code);
+        Self::new(command, stream_id, payload.freeze())
+    }
+
+    /// The error code of an RST or STOP frame. The codec has already
+    /// checked the payload size.
+    pub fn error_code(&self) -> u64 {
+        debug_assert!(matches!(
+            self.header.command,
+            MuxCommand::Reset | MuxCommand::StopSending
+        ));
+        (&self.payload[..]).get_u64_le()
+    }
+
     /// The (consumed, window) pair of a UPD frame. The codec has already
     /// checked the payload size.
     pub fn update_fields(&self) -> (u32, u32) {
@@ -137,7 +169,8 @@ impl Decoder for MuxCodec {
         }
         let header = MuxFrameHeader::decode(self.version, src)?;
         // Per smux v1, only PSH carries payload; SYN/FIN/NOP must be empty.
-        // A v2 UPD carries exactly its two counters.
+        // A v2 UPD carries exactly its two counters, RST and STOP their
+        // error codes.
         // These checks depend only on the header, so reject immediately rather
         // than waiting for an invalid peer to deliver its claimed payload.
         match header.command {
@@ -147,13 +180,23 @@ impl Decoder for MuxCodec {
             MuxCommand::Update if header.length as usize != UPD_PAYLOAD_SIZE => {
                 return Err(MuxError::InvalidUpdatePayload(header.length));
             }
+            MuxCommand::Reset | MuxCommand::StopSending
+                if header.length as usize != ERROR_CODE_PAYLOAD_SIZE =>
+            {
+                return Err(MuxError::InvalidErrorCodePayload(header.length));
+            }
             _ => {}
         }
         match header.command {
             MuxCommand::Nop if header.stream_id != 0 => {
                 return Err(MuxError::InvalidNopStreamId(header.stream_id));
             }
-            MuxCommand::Sync | MuxCommand::Finish | MuxCommand::Push | MuxCommand::Update
+            MuxCommand::Sync
+            | MuxCommand::Finish
+            | MuxCommand::Push
+            | MuxCommand::Update
+            | MuxCommand::Reset
+            | MuxCommand::StopSending
                 if header.stream_id == 0 =>
             {
                 return Err(MuxError::ReservedStreamId(0));

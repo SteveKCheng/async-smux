@@ -45,6 +45,7 @@ impl MuxBuilder<Begin> {
                     max_tx_queue: NonZeroUsize::new(1024).unwrap(),
                     max_rx_queue: NonZeroUsize::new(1024).unwrap(),
                     max_stream_buffer: NonZeroU32::new(INITIAL_PEER_WINDOW).unwrap(),
+                    reset_on_drop: false,
                 },
             },
         }
@@ -63,6 +64,7 @@ impl MuxBuilder<Begin> {
                     max_tx_queue: NonZeroUsize::new(1024).unwrap(),
                     max_rx_queue: NonZeroUsize::new(1024).unwrap(),
                     max_stream_buffer: NonZeroU32::new(INITIAL_PEER_WINDOW).unwrap(),
+                    reset_on_drop: false,
                 },
             },
         }
@@ -83,6 +85,17 @@ impl MuxBuilder<WithConfig> {
     /// `i32::MAX` are clamped.
     pub fn with_max_stream_buffer(&mut self, size: NonZeroU32) -> &mut Self {
         self.state.config.max_stream_buffer = size;
+        self
+    }
+
+    /// With [`ProtocolVersion::V2WithReset`]: make dropping a stream, or
+    /// its write half, while its write half is still open abort that
+    /// direction with RST, rather than finish it with FIN. Data not yet
+    /// written to the carrier is discarded. Finish streams with
+    /// `AsyncWriteExt::shutdown` to end them gracefully. Off by default;
+    /// ignored with other versions.
+    pub fn with_reset_on_drop(&mut self, on: bool) -> &mut Self {
+        self.state.config.reset_on_drop = on;
         self
     }
 

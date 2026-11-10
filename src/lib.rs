@@ -57,7 +57,7 @@
 //! # Configuration
 //!
 //! See [`MuxBuilder`] for the available knobs: `with_version`,
-//! `with_max_stream_buffer`, `with_keep_alive_interval`,
+//! `with_max_stream_buffer`, `with_reset_on_drop`, `with_keep_alive_interval`,
 //! `with_keep_alive_timeout`, `with_idle_timeout`, `with_max_tx_queue`,
 //! `with_max_rx_queue`. Keep-alive and idle timeout are off unless
 //! explicitly enabled.
@@ -69,6 +69,15 @@
 //! has stopped only stalls its own writer. With the default,
 //! [`ProtocolVersion::V1`], it stalls the whole session once the receive
 //! budget is used up. Both ends must be configured with the same version.
+//!
+//! # Aborting streams
+//!
+//! [`ProtocolVersion::V2WithReset`], an extension of this library, adds
+//! RST and STOP frames for aborting one direction of a stream, as QUIC's
+//! RESET_STREAM and STOP_SENDING do. See [`MuxStream::reset`],
+//! [`MuxStream::stop_reading`], [`MuxStream::abort`] and
+//! [`MuxBuilder::with_reset_on_drop`]. [`MuxStream::into_split`] gives
+//! owned halves, each of which can be dropped on its own.
 
 pub mod builder;
 pub mod config;

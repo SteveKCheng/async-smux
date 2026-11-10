@@ -376,16 +376,23 @@ impl<T: TokioConn> Future for MuxTimer<T> {
                         // An unaccepted stream cannot have local writes, so
                         // its FIN can go directly to the control queue before
                         // the handle is reaped.
-                        if state.mark_fully_closed(stream_id) {
+                        if state.version.has_reset() {
+                            state.abort_stream(stream_id, 0);
+                        } else if state.mark_fully_closed(stream_id) {
                             state.send_finish(stream_id);
                         }
                         state.accept_queue.remove(position);
                         state.remove_stream(stream_id);
                     } else {
-                        // Keep FIN behind PSHs already accepted for an active
-                        // stream. Putting it in the global control queue would
-                        // let it overtake the stream's pending data.
-                        if state.mark_fully_closed(stream_id) {
+                        // Under version 255, an idle stream is aborted: its
+                        // pending data is discarded, and the peer's writes
+                        // fail. Otherwise, keep FIN behind PSHs already
+                        // accepted for an active stream. Putting it in the
+                        // global control queue would let it overtake the
+                        // stream's pending data.
+                        if state.version.has_reset() {
+                            state.abort_stream(stream_id, 0);
+                        } else if state.mark_fully_closed(stream_id) {
                             state.enqueue_frame_stream(
                                 stream_id,
                                 MuxFrame::new(MuxCommand::Finish, stream_id, Bytes::new()),
@@ -486,7 +493,7 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
             match frame.header.command {
                 MuxCommand::Sync => {
                     if state.accept_closed {
-                        state.send_finish(frame.header.stream_id);
+                        state.refuse_stream(frame.header.stream_id);
                         continue;
                     }
 
@@ -500,8 +507,21 @@ impl<T: TokioConn> Future for MuxDispatcher<T> {
                 MuxCommand::Push => {
                     let stream_id = frame.header.stream_id;
                     if !state.recv_push(frame).inspect_err(|_| state.hard_close())? {
-                        state.send_finish(stream_id);
+                        // Data for a stream we no longer have. Under version
+                        // 255, tell the writer to stop rather than answer
+                        // with a FIN for a direction that isn't ours.
+                        if state.version.has_reset() {
+                            state.send_stop(stream_id, 0);
+                        } else {
+                            state.send_finish(stream_id);
+                        }
                     }
+                }
+                MuxCommand::Reset => {
+                    state.recv_reset(&frame);
+                }
+                MuxCommand::StopSending => {
+                    state.recv_stop(&frame);
                 }
                 MuxCommand::Update => {
                     state
@@ -622,6 +642,31 @@ impl<T: TokioConn> MuxStream<T> {
     pub fn get_stream_id(&self) -> u32 {
         self.read.stream_id
     }
+
+    /// Abandon our direction of the stream: discard the data not yet
+    /// written to the carrier, and send RST with `code`. See
+    /// [`MuxWriteHalf::reset`].
+    pub fn reset(&mut self, code: u64) -> MuxResult<()> {
+        self.write.reset(code)
+    }
+
+    /// Abandon the peer's direction of the stream: discard the data not
+    /// yet read, and send STOP with `code`. See
+    /// [`MuxReadHalf::stop_reading`].
+    pub fn stop_reading(&mut self, code: u64) -> MuxResult<()> {
+        self.read.stop_reading(code)
+    }
+
+    /// Abandon both directions of the stream, as [`Self::reset`] and
+    /// [`Self::stop_reading`] do, skipping a direction that has already
+    /// ended. Needs [`ProtocolVersion::V2WithReset`].
+    pub fn abort(&mut self, code: u64) -> MuxResult<()> {
+        self.read.read_buffer = None;
+        let mut state = self.read.state.lock();
+        state.check_can_abort()?;
+        state.abort_stream(self.read.stream_id, code);
+        Ok(())
+    }
 }
 
 impl<T: TokioConn> MuxReadHalf<T> {
@@ -629,12 +674,37 @@ impl<T: TokioConn> MuxReadHalf<T> {
     pub fn get_stream_id(&self) -> u32 {
         self.stream_id
     }
+
+    /// Abandon the peer's direction of the stream, as closing the read end
+    /// of a pipe does: discard the data not yet read, and send STOP with
+    /// `code`, so that the peer's writes fail. Later reads return
+    /// end-of-file. Our own direction is unaffected.
+    ///
+    /// If the peer's direction has already ended, only the unread data is
+    /// discarded. Needs [`ProtocolVersion::V2WithReset`]; fails with
+    /// [`MuxError::Unsupported`] otherwise.
+    pub fn stop_reading(&mut self, code: u64) -> MuxResult<()> {
+        self.read_buffer = None;
+        self.state.lock().stop_reading(self.stream_id, code)
+    }
 }
 
 impl<T: TokioConn> MuxWriteHalf<T> {
     /// The 32-bit smux stream id assigned to this stream.
     pub fn get_stream_id(&self) -> u32 {
         self.stream_id
+    }
+
+    /// Abandon our direction of the stream: discard the data not yet
+    /// written to the carrier, and send RST with `code`. The peer's reads
+    /// fail with `io::ErrorKind::ConnectionReset` instead of ending
+    /// cleanly. Later writes fail. The peer's direction is unaffected.
+    ///
+    /// Fails with [`MuxError::StreamClosed`] if our direction has already
+    /// ended (after `shutdown`, say), and with [`MuxError::Unsupported`]
+    /// unless the session uses [`ProtocolVersion::V2WithReset`].
+    pub fn reset(&mut self, code: u64) -> MuxResult<()> {
+        self.state.lock().reset_writing(self.stream_id, code)
     }
 }
 
@@ -731,7 +801,12 @@ impl<T: TokioConn> AsyncRead for MuxReadHalf<T> {
 
 #[inline]
 fn mux_to_io_err(e: MuxError) -> StdIo::Error {
-    StdIo::Error::other(e)
+    let kind = match e {
+        MuxError::StreamReset(_) => ErrorKind::ConnectionReset,
+        MuxError::StopSending(_) => ErrorKind::BrokenPipe,
+        _ => ErrorKind::Other,
+    };
+    StdIo::Error::new(kind, e)
 }
 
 #[inline]
@@ -751,10 +826,7 @@ impl<T: TokioConn> AsyncWrite for MuxWriteHalf<T> {
 
         let mut state = self.state.lock();
         if state.is_write_closed(self.stream_id) {
-            return Poll::Ready(Err(new_io_err(
-                StdIo::ErrorKind::BrokenPipe,
-                "stream tx is already closed",
-            )));
+            return Poll::Ready(Err(state.write_closed_error(self.stream_id)));
         }
 
         let window =
@@ -790,10 +862,7 @@ impl<T: TokioConn> AsyncWrite for MuxWriteHalf<T> {
         // flushes again while a shutdown is pending. Only a write half
         // closed some other way is reported.
         if state.is_write_closed(self.stream_id) && !state.is_shut_down(self.stream_id) {
-            return Poll::Ready(Err(new_io_err(
-                StdIo::ErrorKind::BrokenPipe,
-                "stream tx is already closed",
-            )));
+            return Poll::Ready(Err(state.write_closed_error(self.stream_id)));
         }
         Poll::Ready(Ok(()))
     }
@@ -834,6 +903,10 @@ struct StreamHandle {
     /// How many of the stream's two halves (`MuxReadHalf`, `MuxWriteHalf`)
     /// are still alive. The handle goes once both have been dropped.
     halves: u8,
+    /// The peer abandoned its direction with RST and this error code.
+    reset_received: Option<u64>,
+    /// The peer asked us, with STOP and this error code, to abandon ours.
+    stop_received: Option<u64>,
 
     tx_queue: VecDeque<MuxFrame>,
     tx_done_waker: Option<Waker>,
@@ -878,6 +951,8 @@ impl StreamHandle {
             write_closed: false,
             shut_down: false,
             halves: 2,
+            reset_received: None,
+            stop_received: None,
             tx_queue: VecDeque::new(),
             tx_done_waker: None,
             unflushed: false,
@@ -989,6 +1064,8 @@ struct MuxState<T: TokioConn> {
     version: ProtocolVersion,
     /// Receive window of each stream (v2).
     max_stream_buffer: u32,
+    /// Dropping a stream whose write half is open sends RST, not FIN.
+    reset_on_drop: bool,
 }
 
 impl<T: TokioConn> Drop for MuxState<T> {
@@ -1033,6 +1110,7 @@ impl<T: TokioConn> MuxState<T> {
             max_rx_queue: config.max_rx_queue.get(),
             version: config.version,
             max_stream_buffer: config.max_stream_buffer.get().min(i32::MAX as u32),
+            reset_on_drop: config.reset_on_drop && config.version.has_reset(),
         }
     }
 
@@ -1087,10 +1165,20 @@ impl<T: TokioConn> MuxState<T> {
         if self.closed {
             return;
         }
+        let may_send_finish = !self.shutdown_requested;
+        if self.reset_on_drop
+            && may_send_finish
+            && self
+                .handles
+                .get(&stream_id)
+                .is_some_and(|h| !h.write_closed)
+        {
+            self.send_reset(stream_id, 0);
+            return;
+        }
         // Preserve every frame already accepted by poll_write even when a
         // remote FIN raced with Drop. Whether we need to originate our own
         // FIN is separate from whether accepted data must be drained.
-        let may_send_finish = !self.shutdown_requested;
         let (drained, should_send_finish) = self
             .handles
             .get_mut(&stream_id)
@@ -1110,8 +1198,17 @@ impl<T: TokioConn> MuxState<T> {
     }
 
     /// The reading half of a stream has been dropped: discard what it
-    /// hasn't read, and whatever the peer sends from now on.
+    /// hasn't read, and whatever the peer sends from now on. Under version
+    /// 255, also tell the peer to stop sending, if it still is.
     fn release_read_half(&mut self, stream_id: u32) {
+        if self.version.has_reset()
+            && !self.closed
+            && !self.shutdown_requested
+            && self.handles.get(&stream_id).is_some_and(|h| !h.read_closed)
+        {
+            self.send_stop(stream_id, 0);
+            return;
+        }
         if let Some(h) = self.handles.get_mut(&stream_id) {
             h.read_closed = true;
             h.rx_queue.clear();
@@ -1128,6 +1225,149 @@ impl<T: TokioConn> MuxState<T> {
         h.halves -= 1;
         if h.halves == 0 {
             self.remove_stream(stream_id);
+        }
+    }
+
+    /// Abandon our direction of a stream with RST: discard the data it has
+    /// queued and not yet handed to the carrier, and accept no more writes.
+    fn send_reset(&mut self, stream_id: u32, code: u64) {
+        if let Some(h) = self.handles.get_mut(&stream_id) {
+            h.write_closed = true;
+            h.tx_queue.clear();
+            h.notify_tx_done();
+        }
+        // Nothing of this stream is left to wait for, so the RST may go
+        // ahead of other streams' data.
+        self.enqueue_frame_global(MuxFrame::new_with_error_code(
+            MuxCommand::Reset,
+            stream_id,
+            code,
+        ));
+        self.notify_should_tx();
+    }
+
+    /// Abandon the peer's direction of a stream with STOP: discard what we
+    /// haven't read, and whatever arrives from now on.
+    fn send_stop(&mut self, stream_id: u32, code: u64) {
+        if let Some(h) = self.handles.get_mut(&stream_id) {
+            h.read_closed = true;
+            h.rx_queue.clear();
+            h.rx_buffered = 0;
+            h.notify_rx_ready();
+        }
+        self.enqueue_frame_global(MuxFrame::new_with_error_code(
+            MuxCommand::StopSending,
+            stream_id,
+            code,
+        ));
+        self.notify_should_tx();
+        self.notify_rx_consumed();
+    }
+
+    /// Abandon whichever directions of a stream are still open, with RST
+    /// and STOP. Only for version 255.
+    fn abort_stream(&mut self, stream_id: u32, code: u64) {
+        let Some(h) = self.handles.get(&stream_id) else {
+            return;
+        };
+        let (write_open, read_open) = (!h.write_closed, !h.read_closed);
+        if write_open {
+            self.send_reset(stream_id, code);
+        }
+        if read_open {
+            self.send_stop(stream_id, code);
+        }
+    }
+
+    /// Turn down a stream the peer opened that nobody will accept: RST and
+    /// STOP under version 255, so that the peer's writes fail rather than
+    /// disappear, and FIN otherwise.
+    fn refuse_stream(&mut self, stream_id: u32) {
+        if self.version.has_reset() {
+            self.send_reset(stream_id, 0);
+            self.send_stop(stream_id, 0);
+        } else {
+            self.send_finish(stream_id);
+        }
+    }
+
+    /// The peer abandoned its direction of a stream: drop what it sent
+    /// that hasn't been read, and fail the next read.
+    fn recv_reset(&mut self, frame: &MuxFrame) {
+        let code = frame.error_code();
+        if let Some(h) = self.handles.get_mut(&frame.header.stream_id) {
+            h.last_active = Instant::now();
+            // After the peer's FIN, or our STOP, the direction has already
+            // ended, and the RST changes nothing.
+            if !h.read_closed {
+                h.read_closed = true;
+                h.reset_received = Some(code);
+                h.rx_queue.clear();
+                h.rx_buffered = 0;
+                h.notify_rx_ready();
+            }
+        }
+        self.notify_rx_consumed();
+    }
+
+    /// The peer stopped reading a stream: abandon our direction with an
+    /// RST echoing its code, unless that direction has already ended.
+    fn recv_stop(&mut self, frame: &MuxFrame) {
+        let stream_id = frame.header.stream_id;
+        let code = frame.error_code();
+        let Some(h) = self.handles.get_mut(&stream_id) else {
+            return;
+        };
+        h.last_active = Instant::now();
+        h.stop_received.get_or_insert(code);
+        if h.write_closed {
+            // A FIN is already queued, which ends the direction just as
+            // well. Wake the writer anyway, so that it sees the code.
+            h.notify_tx_done();
+        } else {
+            self.send_reset(stream_id, code);
+        }
+    }
+
+    fn check_can_abort(&self) -> MuxResult<()> {
+        if !self.version.has_reset() {
+            return Err(MuxError::Unsupported);
+        }
+        self.check_accepting_work()
+    }
+
+    /// `MuxWriteHalf::reset`.
+    fn reset_writing(&mut self, stream_id: u32, code: u64) -> MuxResult<()> {
+        self.check_can_abort()?;
+        if self.handles.get(&stream_id).is_none_or(|h| h.write_closed) {
+            return Err(MuxError::StreamClosed(stream_id));
+        }
+        self.send_reset(stream_id, code);
+        Ok(())
+    }
+
+    /// `MuxReadHalf::stop_reading`.
+    fn stop_reading(&mut self, stream_id: u32, code: u64) -> MuxResult<()> {
+        self.check_can_abort()?;
+        let Some(h) = self.handles.get_mut(&stream_id) else {
+            return Err(MuxError::StreamClosed(stream_id));
+        };
+        if h.read_closed {
+            h.rx_queue.clear();
+            h.rx_buffered = 0;
+            self.notify_rx_consumed();
+        } else {
+            self.send_stop(stream_id, code);
+        }
+        Ok(())
+    }
+
+    /// The error a write reports once the stream's write half is closed:
+    /// the peer's STOP if there was one, a plain broken pipe otherwise.
+    fn write_closed_error(&self, stream_id: u32) -> StdIo::Error {
+        match self.handles.get(&stream_id).and_then(|h| h.stop_received) {
+            Some(code) => mux_to_io_err(MuxError::StopSending(code)),
+            None => new_io_err(ErrorKind::BrokenPipe, "stream tx is already closed"),
         }
     }
 
@@ -1163,7 +1403,9 @@ impl<T: TokioConn> MuxState<T> {
 
     fn close_unaccepted_streams(&mut self) {
         while let Some(stream_id) = self.accept_queue.pop_front() {
-            if self.mark_fully_closed(stream_id) {
+            if self.version.has_reset() {
+                self.abort_stream(stream_id, 0);
+            } else if self.mark_fully_closed(stream_id) {
                 self.send_finish(stream_id);
             }
             self.remove_stream(stream_id);
@@ -1374,6 +1616,9 @@ impl<T: TokioConn> MuxState<T> {
             // Handle missing -> stream is gone. Surface as EOF.
             return Poll::Ready(Ok(None));
         };
+        if let Some(code) = handle.reset_received {
+            return Poll::Ready(Err(MuxError::StreamReset(code)));
+        }
         if let Some(f) = handle.rx_queue.pop_front() {
             handle.rx_buffered -= f.payload.len();
             if self.version.has_flow_control() {
@@ -1750,6 +1995,7 @@ mod alloc_tests {
             max_tx_queue: NonZeroUsize::new(1024).unwrap(),
             max_rx_queue: NonZeroUsize::new(1024).unwrap(),
             max_stream_buffer: NonZeroU32::new(INITIAL_PEER_WINDOW).unwrap(),
+            reset_on_drop: false,
         };
         MuxState::new(Framed::new(a, MuxCodec::new(cfg.version)), cfg)
     }

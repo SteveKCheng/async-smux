@@ -22,6 +22,13 @@ pub enum ProtocolVersion {
     /// The receiver sends a new frame type, UPD, to inform the sender
     /// of its current receive window.
     V2,
+    /// Version 2 plus two frames for aborting one direction of a stream,
+    /// modelled on QUIC: RST, with which a writer abandons its direction,
+    /// and STOP, with which a reader asks the writer to abandon it. Both
+    /// carry a 64-bit error code. This is an extension of async-smux, with
+    /// version byte 255; the golang implementation doesn't support it.
+    /// See `docs/stream-reset.md`.
+    V2WithReset,
 }
 
 impl ProtocolVersion {
@@ -30,6 +37,7 @@ impl ProtocolVersion {
         match self {
             ProtocolVersion::V1 => 1,
             ProtocolVersion::V2 => 2,
+            ProtocolVersion::V2WithReset => 255,
         }
     }
 
@@ -37,7 +45,15 @@ impl ProtocolVersion {
     pub(crate) fn has_flow_control(self) -> bool {
         match self {
             ProtocolVersion::V1 => false,
-            ProtocolVersion::V2 => true,
+            ProtocolVersion::V2 | ProtocolVersion::V2WithReset => true,
+        }
+    }
+
+    /// Whether streams can be aborted with RST and STOP frames.
+    pub(crate) fn has_reset(self) -> bool {
+        match self {
+            ProtocolVersion::V1 | ProtocolVersion::V2 => false,
+            ProtocolVersion::V2WithReset => true,
         }
     }
 }
@@ -86,4 +102,10 @@ pub struct MuxConfig {
     /// reader has consumed half of it. Values above `i32::MAX` are
     /// clamped, since the golang implementation treats the window as signed.
     pub max_stream_buffer: NonZeroU32,
+    /// With [`ProtocolVersion::V2WithReset`]: dropping a stream, or its
+    /// write half, while the write half is still open sends RST instead of
+    /// FIN, and discards the data not yet written to the carrier. Streams
+    /// must then be finished with `shutdown()` to end them gracefully.
+    /// Ignored with other versions.
+    pub reset_on_drop: bool,
 }

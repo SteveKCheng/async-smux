@@ -92,6 +92,9 @@ let (connector, acceptor, worker) = MuxBuilder::server()
     .with_version(ProtocolVersion::V2)
     // Receive window per stream (v2 only). Defaults to 256 KiB.
     .with_max_stream_buffer(NonZeroU32::new(256 * 1024).unwrap())
+    // With ProtocolVersion::V2WithReset only: dropping a stream before
+    // `shutdown()` aborts it with RST instead of finishing it with FIN.
+    .with_reset_on_drop(false)
     // Send a NOP frame every N seconds to keep the connection alive.
     .with_keep_alive_interval(NonZeroU64::new(15).unwrap())
     // If we don't see any frame from the peer for this many seconds,
@@ -127,12 +130,24 @@ has consumed, and a writer waits once the peer's window is full, so a
 stalled stream only stalls its own writer. A peer that sends more than
 the window is a protocol error. See `docs/flow-control.md`.
 
+Version 255 (`ProtocolVersion::V2WithReset`) is an extension of this
+library, which the Go implementation doesn't support. It adds to
+version 2 two frames for aborting one direction of a stream, modelled on
+QUIC: RST, with which a writer abandons its direction, and STOP, with
+which a reader asks the writer to abandon it. A reader then sees
+`ConnectionReset` rather than a clean end-of-file, and a writer
+`BrokenPipe`, each with the peer's 64-bit error code
+(`MuxError::from_io`). Streams can be aborted with `MuxStream::reset`,
+`stop_reading` and `abort`, or simply by dropping them; see
+`docs/stream-reset.md`. `MuxStream::into_split` gives owned read and
+write halves, whose drops each affect only their own direction.
+
 ## Frame format
 
 ```text
 VERSION(1B) | CMD(1B) | LENGTH(2B LE) | STREAMID(4B LE) | DATA(LENGTH)
 
-VERSION: 1 or 2, as configured; any other value is a protocol error
+VERSION: 1, 2 or 255, as configured; any other value is a protocol error
 CMD:
     SYN(0)  open stream  (LENGTH must be 0)
     FIN(1)  close sender's write direction (LENGTH must be 0)
@@ -142,6 +157,11 @@ CMD:
             CONSUMED(4B LE) | WINDOW(4B LE)
             CONSUMED counts the bytes read from the stream so far,
             modulo 2^32; WINDOW is the receiver's window
+    RST(5)  reset, v255 only (LENGTH must be 8): ERROR_CODE(8B LE)
+            the sender abandons its direction of the stream
+    STOP(6) stop sending, v255 only (LENGTH must be 8): ERROR_CODE(8B LE)
+            the sender asks the peer to abandon its direction; the peer
+            answers with RST unless it has already sent FIN
 ```
 
 Stream id 0 is reserved for NOP; the library never hands it out and
