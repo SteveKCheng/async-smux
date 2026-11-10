@@ -1,5 +1,27 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 
+/// The smux protocol spoken on the carrier. smux has no version
+/// negotiation, so both ends must be configured alike; a frame with a
+/// different version byte is a protocol error that closes the session.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProtocolVersion {
+    /// SYN, FIN, PSH and NOP. There is no per-stream flow control: when
+    /// the session-wide receive budget ([`MuxConfig::max_rx_queue`]) runs
+    /// out, the carrier stops being read, and every stream stalls.
+    #[default]
+    V1,
+}
+
+impl ProtocolVersion {
+    /// The version byte at the start of every frame.
+    pub(crate) fn wire_byte(self) -> u8 {
+        match self {
+            ProtocolVersion::V1 => 1,
+        }
+    }
+}
+
 /// Parity used for locally-allocated stream ids. Server uses `Even`
 /// (0, 2, 4, …) and client uses `Odd` (1, 3, 5, …) so the two sides
 /// never collide. Stream id 0 is reserved for NOP keep-alive frames
@@ -15,6 +37,8 @@ pub enum StreamIdType {
 /// [`crate::mux_connection`].
 #[derive(Clone, Copy, Debug)]
 pub struct MuxConfig {
+    /// Protocol version. See [`ProtocolVersion`].
+    pub version: ProtocolVersion,
     /// Parity for locally-allocated stream ids. See [`StreamIdType`].
     pub stream_id_type: StreamIdType,
     /// If set, send a NOP frame this often (seconds) and enable

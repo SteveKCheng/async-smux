@@ -8,7 +8,7 @@
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use crate::{
-    config::{MuxConfig, StreamIdType},
+    config::{MuxConfig, ProtocolVersion, StreamIdType},
     mux::{MuxWorker, TokioConn},
     mux_connection, MuxAcceptor, MuxConnector,
 };
@@ -37,6 +37,7 @@ impl MuxBuilder<Begin> {
         MuxBuilder {
             state: WithConfig {
                 config: MuxConfig {
+                    version: ProtocolVersion::V1,
                     stream_id_type: StreamIdType::Odd,
                     keep_alive_interval: None,
                     keep_alive_timeout: None,
@@ -53,6 +54,7 @@ impl MuxBuilder<Begin> {
         MuxBuilder {
             state: WithConfig {
                 config: MuxConfig {
+                    version: ProtocolVersion::V1,
                     stream_id_type: StreamIdType::Even,
                     keep_alive_interval: None,
                     keep_alive_timeout: None,
@@ -66,6 +68,13 @@ impl MuxBuilder<Begin> {
 }
 
 impl MuxBuilder<WithConfig> {
+    /// Protocol version spoken on the carrier. Both ends must agree;
+    /// defaults to [`ProtocolVersion::V1`].
+    pub fn with_version(&mut self, version: ProtocolVersion) -> &mut Self {
+        self.state.config.version = version;
+        self
+    }
+
     /// Send a NOP keep-alive frame every `interval_secs` seconds. When
     /// set, the dead-peer timeout (see [`Self::with_keep_alive_timeout`])
     /// also becomes active.

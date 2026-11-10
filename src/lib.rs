@@ -56,10 +56,10 @@
 //!
 //! # Configuration
 //!
-//! See [`MuxBuilder`] for the available knobs: `with_keep_alive_interval`,
-//! `with_keep_alive_timeout`, `with_idle_timeout`, `with_max_tx_queue`,
-//! `with_max_rx_queue`. Keep-alive and idle timeout are off unless
-//! explicitly enabled.
+//! See [`MuxBuilder`] for the available knobs: `with_version`,
+//! `with_keep_alive_interval`, `with_keep_alive_timeout`,
+//! `with_idle_timeout`, `with_max_tx_queue`, `with_max_rx_queue`.
+//! Keep-alive and idle timeout are off unless explicitly enabled.
 
 pub mod builder;
 pub mod config;
@@ -68,7 +68,7 @@ pub(crate) mod frame;
 pub(crate) mod mux;
 
 pub use builder::MuxBuilder;
-pub use config::{MuxConfig, StreamIdType};
+pub use config::{MuxConfig, ProtocolVersion, StreamIdType};
 pub use mux::{mux_connection, MuxAcceptor, MuxConnector, MuxStream};
 
 #[cfg(test)]
@@ -1140,7 +1140,7 @@ mod tests {
         use bytes::BytesMut;
         use tokio_util::codec::Decoder;
 
-        let mut codec = MuxCodec {};
+        let mut codec = MuxCodec::new(crate::ProtocolVersion::V1);
         let mut buf = BytesMut::new();
         // version=1, cmd=NOP(3), length=4 LE, stream_id=0 LE, payload=4 bytes.
         buf.extend_from_slice(&[1, 3, 4, 0, 0, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd]);
@@ -1154,7 +1154,7 @@ mod tests {
         use bytes::BytesMut;
         use tokio_util::codec::Decoder;
 
-        let mut codec = MuxCodec {};
+        let mut codec = MuxCodec::new(crate::ProtocolVersion::V1);
 
         let mut nop_with_stream = BytesMut::from(&raw_frame(3, 2, &[])[..]);
         assert!(
@@ -1178,7 +1178,7 @@ mod tests {
         // A control frame can never carry a payload, so this header is
         // already invalid even though its claimed 64 KiB body has not arrived.
         let mut wire = BytesMut::from(&[1, 0, 0xff, 0xff, 2, 0, 0, 0][..]);
-        let mut codec = MuxCodec {};
+        let mut codec = MuxCodec::new(crate::ProtocolVersion::V1);
         assert!(codec.decode(&mut wire).is_err());
     }
 
@@ -1189,7 +1189,7 @@ mod tests {
         use tokio_util::codec::Decoder;
 
         let mut wire = BytesMut::new();
-        let mut codec = MuxCodec {};
+        let mut codec = MuxCodec::new(crate::ProtocolVersion::V1);
         assert!(codec.decode(&mut wire).unwrap().is_none());
         assert!(
             wire.capacity() <= HEADER_SIZE * 2,
@@ -2068,7 +2068,7 @@ mod tests {
         const SEED: u64 = 0xd15c_a11e_5eed_1234;
         const FRAMES: usize = 256;
         let mut rng = StdRng::seed_from_u64(SEED);
-        let mut encoder = MuxCodec {};
+        let mut encoder = MuxCodec::new(crate::ProtocolVersion::V1);
         let mut wire = BytesMut::new();
         let mut expected = Vec::with_capacity(FRAMES);
 
@@ -2106,7 +2106,7 @@ mod tests {
         }
 
         let wire = wire.freeze();
-        let mut decoder = MuxCodec {};
+        let mut decoder = MuxCodec::new(crate::ProtocolVersion::V1);
         let mut buffered = BytesMut::new();
         let mut actual = Vec::with_capacity(FRAMES);
         let mut offset = 0;

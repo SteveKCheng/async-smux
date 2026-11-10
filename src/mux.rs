@@ -40,7 +40,7 @@ pub fn mux_connection<T: TokioConn>(
     connection: T,
     config: MuxConfig,
 ) -> (MuxConnector<T>, MuxAcceptor<T>, MuxWorker<T>) {
-    let inner = Framed::new(connection, MuxCodec {});
+    let inner = Framed::new(connection, MuxCodec::new(config.version));
     let mut state = MuxState::new(inner, config);
     // Expose 2 public handles: connector + acceptor.
     state.public_handles = 2;
@@ -1459,7 +1459,7 @@ impl<T: TokioConn> MuxState<T> {
 #[cfg(test)]
 mod alloc_tests {
     use super::*;
-    use crate::config::StreamIdType;
+    use crate::config::{ProtocolVersion, StreamIdType};
     use std::num::{NonZeroUsize, Wrapping};
 
     fn fresh_state(stream_id_type: StreamIdType) -> MuxState<tokio::io::DuplexStream> {
@@ -1467,6 +1467,7 @@ mod alloc_tests {
         // uses so new MuxState fields don't need duplicating here.
         let (a, _b) = tokio::io::duplex(64);
         let cfg = MuxConfig {
+            version: ProtocolVersion::V1,
             stream_id_type,
             keep_alive_interval: None,
             keep_alive_timeout: None,
@@ -1474,7 +1475,7 @@ mod alloc_tests {
             max_tx_queue: NonZeroUsize::new(1024).unwrap(),
             max_rx_queue: NonZeroUsize::new(1024).unwrap(),
         };
-        MuxState::new(Framed::new(a, MuxCodec {}), cfg)
+        MuxState::new(Framed::new(a, MuxCodec::new(cfg.version)), cfg)
     }
 
     // BUG: with stream_id_hint = Wrapping(0) (Even side), repeated alloc

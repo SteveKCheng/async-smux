@@ -3,9 +3,11 @@ use tokio_util::codec::{Decoder, Encoder};
 
 use std::io::Cursor;
 
-use crate::error::{MuxError, MuxResult};
+use crate::{
+    config::ProtocolVersion,
+    error::{MuxError, MuxResult},
+};
 
-pub const SMUX_VERSION: u8 = 1;
 pub const HEADER_SIZE: usize = 8;
 pub const MAX_PAYLOAD_SIZE: usize = 0xffff;
 
@@ -33,7 +35,6 @@ impl TryFrom<u8> for MuxCommand {
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) struct MuxFrameHeader {
-    pub version: u8,
     pub command: MuxCommand,
     pub length: u16,
     pub stream_id: u32,
@@ -41,25 +42,24 @@ pub(crate) struct MuxFrameHeader {
 
 impl MuxFrameHeader {
     #[inline]
-    fn encode(&self, buf: &mut BytesMut) {
-        buf.put_u8(self.version);
+    fn encode(&self, version: ProtocolVersion, buf: &mut BytesMut) {
+        buf.put_u8(version.wire_byte());
         buf.put_u8(self.command as u8);
         buf.put_u16_le(self.length);
         buf.put_u32_le(self.stream_id);
     }
 
     #[inline]
-    fn decode(buf: &[u8]) -> MuxResult<Self> {
+    fn decode(version: ProtocolVersion, buf: &[u8]) -> MuxResult<Self> {
         let mut cursor = Cursor::new(buf);
-        let version = cursor.get_u8();
-        if version != SMUX_VERSION {
-            return Err(MuxError::InvalidVersion(version));
+        let wire_version = cursor.get_u8();
+        if wire_version != version.wire_byte() {
+            return Err(MuxError::InvalidVersion(wire_version));
         }
         let command = MuxCommand::try_from(cursor.get_u8())?;
         let length = cursor.get_u16_le();
         let stream_id = cursor.get_u32_le();
         Ok(Self {
-            version,
             command,
             length,
             stream_id,
@@ -78,7 +78,6 @@ impl MuxFrame {
         assert!(payload.len() <= MAX_PAYLOAD_SIZE);
         Self {
             header: MuxFrameHeader {
-                version: SMUX_VERSION,
                 command,
                 length: payload.len() as u16,
                 stream_id,
@@ -88,7 +87,18 @@ impl MuxFrame {
     }
 }
 
-pub(crate) struct MuxCodec {}
+/// Encodes and decodes frames of one protocol version. smux has no version
+/// negotiation: both ends must be configured alike, and a frame stamped
+/// with another version is a protocol error.
+pub(crate) struct MuxCodec {
+    version: ProtocolVersion,
+}
+
+impl MuxCodec {
+    pub fn new(version: ProtocolVersion) -> Self {
+        Self { version }
+    }
+}
 
 impl Decoder for MuxCodec {
     type Item = MuxFrame;
@@ -99,7 +109,7 @@ impl Decoder for MuxCodec {
             src.reserve(HEADER_SIZE - src.len());
             return Ok(None);
         }
-        let header = MuxFrameHeader::decode(src)?;
+        let header = MuxFrameHeader::decode(self.version, src)?;
         // Per smux v1, only PSH carries payload; SYN/FIN/NOP must be empty.
         // These checks depend only on the header, so reject immediately rather
         // than waiting for an invalid peer to deliver its claimed payload.
@@ -139,15 +149,11 @@ impl Encoder<MuxFrame> for MuxCodec {
     type Error = MuxError;
 
     fn encode(&mut self, item: MuxFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        if item.header.version != SMUX_VERSION {
-            return Err(MuxError::InvalidVersion(item.header.version));
-        }
-
         if item.payload.len() > MAX_PAYLOAD_SIZE {
             return Err(MuxError::PayloadTooLarge(item.payload.len()));
         }
 
-        item.header.encode(dst);
+        item.header.encode(self.version, dst);
         dst.put_slice(&item.payload);
 
         Ok(())
